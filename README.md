@@ -93,11 +93,31 @@ The two dials, swept on the hardest scene:
 | 55 | 3.5% | 2.6% | 0.9% | 0% |
 | 70 | 2.6% | 1.7% | 0% | 0% |
 
-The defaults match Frigate's, which have been run against far more cameras than
-this. They are kept rather than tuned down because lowering the false-positive
-rate necessarily costs recall, and measuring that trade needs footage with
-verified movement in it — which this has not been tested against yet. Treat the
-table as a tuning guide, not as a recommendation to change the defaults blind.
+### Recall, and why the defaults stay
+
+Every row above lowers the false-positive rate, and every row must also lower
+recall. Measured against 50 night events taken from a running recorder's own
+event log — an index to clips where something actually happened, which random
+sampling cannot supply:
+
+| setting | recall | false positives |
+| --- | --- | --- |
+| **thr 30 / area 10** (default) | **78%** | 0–72%, scene-dependent |
+| thr 40 / area 20 | 64% | ~11–21% |
+| thr 55 / area 40 | **48%** | 0–1% |
+| thr 70 / area 40 | 48% | 0% |
+
+**No setting is both quiet and sensitive.** The configuration that looks best on
+the false-positive table alone loses three in ten real events.
+
+So the defaults stay where Frigate put them, and the answer to a noisy camera is
+**a mask, not a higher threshold** — a mask removes the specific thing that
+moves without costing sensitivity anywhere else in the frame. Treat the sweep as
+a tuning guide, not a recommendation.
+
+That recall figure is agreement with a mature detector rather than with truth,
+so it inherits that detector's mistakes. Spot-checking misses found no visible
+subject in several, which suggests 78% is a floor.
 
 ## Downscaling is not a detail
 
