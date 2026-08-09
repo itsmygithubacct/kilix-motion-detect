@@ -1,5 +1,7 @@
 #include "kilix_motion_detect.h"
 
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +84,13 @@ test_config_defaults_and_rejections(void)
     kmd_config config;
     kmd_detector *detector = NULL;
 
+    kmd_config_init(NULL);
+    kmd_detector_free(NULL);
+    kmd_detector_reset(NULL);
+    CHECK(!kmd_detector_set_mask(NULL, NULL, 0u));
+    CHECK(kmd_detector_scaled_width(NULL) == 0);
+    CHECK(kmd_detector_scaled_height(NULL) == 0);
+
     kmd_config_init(&config);
     CHECK(config.detect_height == 100);
     CHECK(config.threshold == 30);
@@ -122,9 +131,164 @@ test_config_defaults_and_rejections(void)
     config.blur_radius = 1;
     config.pixfmt = (kmd_pixfmt)99;
     CHECK(!kmd_detector_create(&detector, &config));
+    config.pixfmt = KMD_PIXFMT_GRAY;
+
+    config.frame_alpha = NAN;
+    CHECK(!kmd_detector_create(&detector, &config));
+    config.frame_alpha = 0.01f;
+    config.lightning_threshold = NAN;
+    CHECK(!kmd_detector_create(&detector, &config));
+    config.lightning_threshold = -0.1f;
+    CHECK(!kmd_detector_create(&detector, &config));
+    config.lightning_threshold = 1.1f;
+    CHECK(!kmd_detector_create(&detector, &config));
+    config.lightning_threshold = 0.8f;
+    config.skip_threshold = NAN;
+    CHECK(!kmd_detector_create(&detector, &config));
+    config.skip_threshold = -0.1f;
+    CHECK(!kmd_detector_create(&detector, &config));
+    config.skip_threshold = 1.1f;
+    CHECK(!kmd_detector_create(&detector, &config));
+    config.skip_threshold = 0.0f;
+
+    config.width = INT_MAX;
+    config.height = INT_MAX;
+    CHECK(!kmd_detector_create(&detector, &config));
+    config.width = 50000;
+    config.height = 50000;
+    config.detect_height = 0;
+    CHECK(!kmd_detector_create(&detector, &config));
 
     /* NULL frame and NULL detector are answered, not crashed on. */
-    CHECK(kmd_detect(NULL, NULL, NULL, 0u, NULL) == 0u);
+    {
+        kmd_result result = {99u, 99u, 1.0f, false, true, true};
+
+        CHECK(kmd_detect(NULL, NULL, NULL, 0u, &result) == 0u);
+        CHECK(result.count == 0u && result.found == 0u);
+        CHECK(result.motion_fraction == 0.0f);
+        CHECK(result.calibrating);
+        CHECK(!result.scene_changed && !result.skipped);
+    }
+    return true;
+}
+
+/* Degenerate dimensions still have one real pixel.  The label allocator must
+ * not reserve that only possible label away, and an enormous blur radius must
+ * collapse to the available image rather than walking billions of samples. */
+static bool
+test_one_pixel_frame_and_bounded_blur(void)
+{
+    kmd_config config;
+    kmd_detector *detector = NULL;
+    kmd_box box;
+    kmd_result result;
+    uint8_t frame = 0u;
+
+    kmd_config_init(&config);
+    config.width = 1;
+    config.height = 1;
+    config.detect_height = 0;
+    config.contour_area = 1;
+    config.improve_contrast = false;
+    config.area_average = false;
+    config.blur_radius = INT_MAX;
+    CHECK(kmd_detector_create(&detector, &config));
+    CHECK(kmd_detect(detector, &frame, &box, 1u, &result) == 0u);
+    frame = 255u;
+    CHECK(kmd_detect(detector, &frame, &box, 1u, &result) == 1u);
+    CHECK(result.found == 1u);
+    CHECK(box.x0 == 0 && box.y0 == 0 && box.x1 == 1 && box.y1 == 1);
+    kmd_detector_free(detector);
+    return true;
+}
+
+/* On a frame smaller than the percentile denominator, the 4th percentile is
+ * still the first real sample, not an invented black value. */
+static bool
+test_tiny_contrast_uses_a_real_sample(void)
+{
+    kmd_config config;
+    kmd_detector *detector = NULL;
+    const uint8_t frame[2] = {100u, 200u};
+    kmd_result result;
+
+    kmd_config_init(&config);
+    config.width = 2;
+    config.height = 1;
+    config.detect_height = 0;
+    config.threshold = 100;
+    config.contour_area = 1;
+    config.blur_radius = 0;
+    config.area_average = false;
+    config.lightning_threshold = 1.0f;
+    CHECK(kmd_detector_create(&detector, &config));
+    (void)kmd_detect(detector, frame, NULL, 0u, &result);
+    CHECK(result.motion_fraction == 0.5f);
+    kmd_detector_free(detector);
+    return true;
+}
+
+/* An averaged frame must use an area-scaled mask too.  Point-sampling the
+ * mask from a zero source pixel used to hide motion in the other unmasked
+ * pixels that contributed to the same working cell. */
+static bool
+test_area_average_mask_keeps_unmasked_subcell(void)
+{
+    kmd_config config;
+    kmd_detector *detector = NULL;
+    const uint8_t mask[8] = {0u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
+    uint8_t frame[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+    kmd_result result;
+
+    kmd_config_init(&config);
+    config.width = 4;
+    config.height = 2;
+    config.detect_height = 1;
+    config.threshold = 1;
+    config.contour_area = 1;
+    config.improve_contrast = false;
+    config.area_average = true;
+    config.blur_radius = 0;
+    CHECK(kmd_detector_create(&detector, &config));
+    CHECK(kmd_detector_set_mask(detector, mask, sizeof(mask)));
+    (void)kmd_detect(detector, frame, NULL, 0u, &result);
+    frame[1] = 255u; /* active, but not the old point-sampled source pixel */
+    (void)kmd_detect(detector, frame, NULL, 0u, &result);
+    CHECK(result.found == 1u);
+    kmd_detector_free(detector);
+    return true;
+}
+
+/* Float scale factors could round an exclusive full-frame edge down by one;
+ * exact integer mapping must always return the complete source extent. */
+static bool
+test_boxes_reach_exact_source_edges(void)
+{
+    enum { WIDTH = 39, HEIGHT = 62 };
+    kmd_config config;
+    kmd_detector *detector = NULL;
+    uint8_t frame[(size_t)WIDTH * HEIGHT];
+    kmd_box box;
+    kmd_result result;
+
+    kmd_config_init(&config);
+    config.width = WIDTH;
+    config.height = HEIGHT;
+    config.detect_height = 28;
+    config.threshold = 1;
+    config.contour_area = 1;
+    config.improve_contrast = false;
+    config.area_average = true;
+    config.blur_radius = 0;
+    CHECK(kmd_detector_create(&detector, &config));
+    memset(frame, 0, sizeof(frame));
+    (void)kmd_detect(detector, frame, NULL, 0u, &result);
+    memset(frame, 255, sizeof(frame));
+    CHECK(kmd_detect(detector, frame, &box, 1u, &result) == 1u);
+    CHECK(result.found == 1u);
+    CHECK(box.x0 == 0 && box.y0 == 0);
+    CHECK(box.x1 == WIDTH && box.y1 == HEIGHT);
+    kmd_detector_free(detector);
     return true;
 }
 
@@ -366,11 +530,16 @@ test_skip_threshold_when_enabled(void)
     CHECK(settle(detector, frame, 60));
 
     scene(frame, 0, 0, 0, 0, 240u, 0u);
+    for (size_t index = 0u; index < sizeof(boxes) / sizeof(boxes[0]); index++) {
+        boxes[index] = (kmd_box){11, 22, 33, 44};
+    }
     count = kmd_detect(detector, frame, boxes, 8u, &result);
     CHECK(result.skipped);
     CHECK(count == 0u);
     CHECK(result.count == 0u);
     CHECK(result.found == 0u);
+    CHECK(boxes[0].x0 == 11 && boxes[0].y0 == 22);
+    CHECK(boxes[0].x1 == 33 && boxes[0].y1 == 44);
 
     /* The model must follow the new condition, or every later frame skips
      * too and the camera goes permanently blind. */
@@ -613,6 +782,13 @@ main(void)
 {
     static const test_case tests[] = {
         {"config defaults and rejections", test_config_defaults_and_rejections},
+        {"one pixel frame and bounded blur",
+         test_one_pixel_frame_and_bounded_blur},
+        {"tiny contrast uses a real sample",
+         test_tiny_contrast_uses_a_real_sample},
+        {"area-average mask keeps unmasked subcell",
+         test_area_average_mask_keeps_unmasked_subcell},
+        {"boxes reach exact source edges", test_boxes_reach_exact_source_edges},
         {"a still scene reports no motion",
          test_a_still_scene_reports_no_motion},
         {"a moving subject is found", test_a_moving_subject_is_found},

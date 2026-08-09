@@ -17,9 +17,9 @@
  * consumer - a detector wants square crops at its input resolution, a UI
  * overlay wants the boxes as they are - so they belong to the consumer.
  *
- * Dependencies: C11 and libm.  No image library, no threads, no
- * allocation after setup.  A caller supplies pixels and gets integers
- * back.
+ * The only build dependency is a C11 toolchain.  No image library or workers.
+ * kmd_detect() performs no allocation; detector creation and installing a
+ * first mask may allocate.  A caller supplies pixels and gets integers back.
  */
 
 #include <stdbool.h>
@@ -31,7 +31,7 @@ extern "C" {
 #endif
 
 #define KILIX_MOTION_DETECT_VERSION_MAJOR 0
-#define KILIX_MOTION_DETECT_VERSION_MINOR 1
+#define KILIX_MOTION_DETECT_VERSION_MINOR 2
 #define KILIX_MOTION_DETECT_VERSION_PATCH 0
 
 /*
@@ -73,8 +73,9 @@ typedef struct kmd_config {
      * smallest detectable object from about four source pixels to about
      * six.  Nothing anyone cares about is six pixels.
      *
-     * Default 100, which is also what Frigate uses.  Zero means "do not
-     * scale", which is almost never what you want.
+     * Default 100, which is also what Frigate uses.  Zero or a value at least
+     * as large as the source height means "do not scale", which is almost
+     * never what you want.
      */
     int detect_height;
 
@@ -100,10 +101,10 @@ typedef struct kmd_config {
 
     /*
      * How fast the background model follows the scene, per frame.
-     * Default 0.01: a change persists as motion for about a hundred
-     * frames before becoming the new background.  Raise it and a person
-     * standing still vanishes sooner; lower it and a moved chair reports
-     * motion for minutes.
+     * Must be finite and in (0, 1].  Default 0.01: a change persists as
+     * motion for about a hundred frames before becoming the new background.
+     * Raise it and a person standing still vanishes sooner; lower it and a
+     * moved chair reports motion for minutes.
      */
     float frame_alpha;
 
@@ -122,9 +123,9 @@ typedef struct kmd_config {
      * rather than "something moved" - an IR cutover, a light switching
      * on, a camera being repointed.  Default 0.8.
      *
-     * Crossing it forces the background model to re-converge and sets
-     * `scene_changed` on the result.  Boxes are still reported: the frame
-     * is flagged, not hidden.
+     * Must be finite and in [0, 1].  Crossing it forces the background model
+     * to re-converge and sets `scene_changed` on the result.  Boxes are still
+     * reported: the frame is flagged, not hidden.
      */
     float lightning_threshold;
 
@@ -132,12 +133,12 @@ typedef struct kmd_config {
      * Fraction of the frame changing above which boxes are suppressed
      * entirely and the frame reports `skipped`.
      *
-     * Disabled by default (0), and that default is deliberate.  Skipping
-     * is the only behaviour here that can hide something real: a camera
-     * panning across a person reports no motion at all, and a recorder
-     * gated on motion therefore stores nothing.  It saves work during
-     * storms and IR flapping, which is a fair trade to make knowingly and
-     * a poor one to inherit.
+     * Must be finite and in [0, 1].  Disabled by default (0), and that default
+     * is deliberate.  Skipping is the only behaviour here that can hide
+     * something real: a camera panning across a person reports no motion at
+     * all, and a recorder gated on motion therefore stores nothing.  It saves
+     * work during storms and IR flapping, which is a fair trade to make
+     * knowingly and a poor one to inherit.
      */
     float skip_threshold;
 
@@ -162,7 +163,9 @@ typedef struct kmd_config {
     /*
      * Box blur radius applied before differencing, in scaled pixels.
      * Default 1.  Zero disables it, which roughly doubles the number of
-     * single-pixel sensor-noise blobs on IR footage.
+     * single-pixel sensor-noise blobs on IR footage.  Values larger than a
+     * working dimension are clamped to that dimension's complete extent, so
+     * work remains proportional to the frame rather than to the radius.
      */
     int blur_radius;
 } kmd_config;
@@ -173,9 +176,10 @@ void kmd_config_init(kmd_config *config);
 typedef struct kmd_detector kmd_detector;
 
 /*
- * Allocate a detector.  All working buffers are allocated here and none
- * afterwards, so kmd_detect() cannot fail for want of memory and can be
- * called from a loop that must not stall.
+ * Allocate a detector.  All per-frame working buffers are allocated here, so
+ * kmd_detect() cannot fail for want of memory and can be called from a loop
+ * that must not stall.  Invalid, non-finite, unrepresentable, or unsafe-size
+ * configuration is rejected and `*detector` is left NULL.
  */
 bool kmd_detector_create(kmd_detector **detector, const kmd_config *config);
 void kmd_detector_free(kmd_detector *detector);
@@ -186,6 +190,12 @@ void kmd_detector_free(kmd_detector *detector);
  * `mask` is one byte per source pixel, `width * height` of them: zero
  * ignores a pixel, anything else keeps it.  It is copied, so the caller's
  * buffer need not outlive the call.  NULL clears any existing mask.
+ *
+ * When area downscaling is active, a working cell remains active if any
+ * source pixel contributing to it is active.  This matches area-resized mask
+ * behavior and prevents a zero at one sample point from hiding other unmasked
+ * pixels in the cell.  Mask boundaries therefore have working-cell
+ * granularity; mask the complete source footprint of a cell to suppress it.
  *
  * A bitmap rather than polygons on purpose.  Rasterising a polygon is a
  * geometry problem, this module is arithmetic on pixels, and a caller
@@ -232,9 +242,10 @@ typedef struct kmd_result {
  * Difference one frame against the background model and report where it
  * changed.
  *
- * `frame` is width * height pixels in the configured format.  Boxes are
- * written in source coordinates - not the scaled ones the module works
- * in - so a caller never has to know detect_height.
+ * `frame` is exactly width * height tightly packed pixels in the configured
+ * format; because the pointer carries no size, the caller owns that bound.
+ * Boxes are written in source coordinates - not the scaled ones the module
+ * works in - so a caller never has to know detect_height.
  *
  * Returns the number of boxes written.  `result` may be NULL, but the
  * calibrating flag is worth reading: acting on boxes before the model has
@@ -242,6 +253,8 @@ typedef struct kmd_result {
  *
  * Frames must arrive in order.  The model is a running average, so
  * feeding unrelated frames interleaved produces motion between them.
+ * A detector is not internally synchronized; distinct detectors may be used
+ * concurrently, while calls touching one detector require external ordering.
  */
 size_t kmd_detect(
     kmd_detector *detector,

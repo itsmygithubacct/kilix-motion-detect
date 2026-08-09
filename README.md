@@ -4,17 +4,20 @@ Frame-difference motion detection in C11: frames in, boxes out.
 
 This exists because motion is the cheap gate in front of expensive work. Object
 detection costs tens of milliseconds a frame; deciding whether anything moved
-costs about two. Running the second only where the first found something is what
-lets one machine watch several cameras.
+costs under one at the default working size on the benchmark host. Running the
+second only where the first found something is what lets one machine watch
+several cameras.
 
-Dependencies are a C11 compiler and libm. No image library, no threads, and no
-allocation after setup.
+The only build dependency is a C11 toolchain. There is no image library and no
+internal worker thread. `kmd_detect()` does not allocate; detector creation and
+installing the first mask may allocate.
 
 ## Build
 
 ```sh
 make
 make test
+make fuzz      # deterministic randomized API and invariant checks
 make sanitize
 make bench      # cost per frame at several working sizes
 ```
@@ -28,8 +31,11 @@ config.width = 640;
 config.height = 360;
 config.pixfmt = KMD_PIXFMT_BGRA;
 
-kmd_detector *detector;
-kmd_detector_create(&detector, &config);
+kmd_detector *detector = NULL;
+if (!kmd_detector_create(&detector, &config)) {
+    /* invalid configuration or allocation failure */
+    return false;
+}
 
 kmd_box boxes[32];
 kmd_result result;
@@ -38,10 +44,17 @@ size_t count = kmd_detect(detector, frame, boxes, 32, &result);
 if (!result.calibrating && count > 0) {
     /* something moved; boxes are in source coordinates */
 }
+
+kmd_detector_free(detector);
 ```
 
-Boxes come back in **source** coordinates, so a caller never has to know what
-the module scaled to internally.
+Each input is exactly `width * height` tightly packed pixels in the configured
+format. The caller owns that bound because the frame pointer carries no size.
+Boxes come back in exact, half-open **source** coordinates, so a caller never
+has to know what the module scaled to internally.
+
+Frames for one detector must arrive in order. Calls touching the same detector
+need external synchronization; distinct detectors can run concurrently.
 
 The scope is deliberately narrow: it reports where pixels changed and nothing
 about what changed them. No classification, no tracking, and no grouping of
@@ -50,14 +63,17 @@ to the consumer.
 
 ## What it costs
 
-Measured on an i7-6820HQ, 640×360 source, 300 frames:
+Measured on an i7-6820HQ with a 640×360 source. These are the medians of seven
+alternating baseline/candidate pairs over 300 detector calls per configuration;
+scene generation is outside the timed region and every run produced the same
+workload and motion-decision checksum.
 
 | working height | ms/frame | vs full res | seven cameras @10fps |
 | --- | --- | --- | --- |
-| 360 (no downscale) | 19.8 | 1.0× | 139% of a core |
-| 180 | 6.2 | 3.2× | 43% |
-| **100** (default) | **2.3** | **8.8×** | **16%** |
-| 64 | 1.4 | 14.4× | 10% |
+| 360 (no downscale) | 8.593 | 1.0× | 60% of a core |
+| 180 | 2.259 | 3.8× | 16% |
+| **100** (default) | **0.778** | **11.0×** | **5.4%** |
+| 64 | 0.365 | 23.5× | 2.6% |
 
 `detect_height` is the largest lever by far, and it costs almost nothing in
 sensitivity: dropping from full resolution to 100 pixels moves the smallest
@@ -130,7 +146,8 @@ candidates differ by more than any sensible threshold. Measured on a still
 workshop full of tools and cables, point sampling reported motion on **100% of
 frames**; area averaging on the same clip reported 24%.
 
-It costs about 30% more per frame. A gate that never closes saves nothing
+At the default working size it costs about 60% more detector time than point
+sampling (0.778 versus 0.480 ms/frame). A gate that never closes saves nothing
 downstream, so it is on by default.
 
 ## Contrast normalisation
@@ -162,10 +179,33 @@ make knowingly and a poor one to inherit.
 
 `kmd_detector_set_mask()` takes one byte per source pixel — zero ignores it.
 
+With area downscaling, a working cell remains active when any contributing
+source pixel is active. Mask boundaries therefore have working-cell granularity:
+mask the full source footprint of a cell to suppress it. The mask is copied, and
+changing or clearing it resets background calibration.
+
 A bitmap rather than polygons, on purpose: rasterising a polygon is a geometry
 problem, this module is arithmetic on pixels, and a caller that has polygons
 already has something that can draw them. It also keeps the module
 dependency-free.
+
+## Failure and lifecycle rules
+
+`kmd_detector_create()` rejects invalid, non-finite, unrepresentable, or unsafe
+configurations and leaves its output pointer null. `frame_alpha` must be finite
+and in `(0, 1]`; the scene-change and skip fractions must be finite and in
+`[0, 1]`. A blur radius larger than the working image is safe and is clamped to
+the image extent.
+
+Creation allocates all per-frame storage, so a successful `kmd_detect()` loop
+cannot later fail for lack of memory. Setting the first mask is the one optional
+post-creation allocation. `kmd_detector_reset()` and mask changes restart
+calibration; consumers should ignore boxes while `result.calibrating` is true.
+
+`make test` covers library behavior and stream-input error paths. `make fuzz`
+adds deterministic randomized configurations, pixel formats, masks, resets,
+capacities, and extreme blur radii. `make sanitize` runs both under
+AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ## License
 

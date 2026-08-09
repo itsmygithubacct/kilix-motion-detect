@@ -13,8 +13,11 @@
 
 #include "kilix_motion_detect.h"
 
+#include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 enum { W = 640, H = 360, FRAMES = 300, WARMUP = 30 };
@@ -60,13 +63,19 @@ static double now_ms(void)
     return (double)now.tv_sec * 1000.0 + (double)now.tv_nsec / 1e6;
 }
 
-static double run(int detect_height, bool contrast, bool average,
-                  uint8_t *frame)
+typedef struct bench_result {
+    double milliseconds;
+    uint64_t checksum;
+} bench_result;
+
+static bench_result run(int detect_height, bool contrast, bool average,
+                        int blur_radius, uint8_t *frame)
 {
     kmd_config config;
     kmd_detector *detector = NULL;
     kmd_box boxes[64];
-    double start;
+    double elapsed = 0.0;
+    uint64_t checksum = UINT64_C(1469598103934665603);
 
     kmd_config_init(&config);
     config.width = W;
@@ -74,24 +83,32 @@ static double run(int detect_height, bool contrast, bool average,
     config.detect_height = detect_height;
     config.improve_contrast = contrast;
     config.area_average = average;
+    config.blur_radius = blur_radius;
     if (!kmd_detector_create(&detector, &config)) {
-        return -1.0;
+        return (bench_result){-1.0, 0u};
     }
+    seed = 1u;
     for (int i = 0; i < WARMUP; i++) {
         scene(frame, 100);
         (void)kmd_detect(detector, frame, boxes, 64u, NULL);
     }
-    start = now_ms();
     for (int i = 0; i < FRAMES; i++) {
-        scene(frame, 100 + (i % 40));
-        (void)kmd_detect(detector, frame, boxes, 64u, NULL);
-    }
-    {
-        const double elapsed = now_ms() - start;
+        kmd_result result;
+        uint32_t fraction_bits;
+        size_t count;
+        double start;
 
-        kmd_detector_free(detector);
-        return elapsed / (double)FRAMES;
+        scene(frame, 100 + (i % 40));
+        start = now_ms();
+        count = kmd_detect(detector, frame, boxes, 64u, &result);
+        elapsed += now_ms() - start;
+        memcpy(&fraction_bits, &result.motion_fraction, sizeof(fraction_bits));
+        checksum ^= (uint64_t)count + ((uint64_t)result.found << 8) +
+                    ((uint64_t)fraction_bits << 16);
+        checksum *= UINT64_C(1099511628211);
     }
+    kmd_detector_free(detector);
+    return (bench_result){elapsed / (double)FRAMES, checksum};
 }
 
 int
@@ -100,6 +117,7 @@ main(void)
     static const int heights[] = {360, 180, 100, 64};
     uint8_t *frame = malloc((size_t)W * H);
     double baseline = 0.0;
+    uint64_t checksum = 0u;
 
     if (frame == NULL) {
         return 1;
@@ -113,7 +131,9 @@ main(void)
         for (int pass = 0; pass < 3; pass++) {
             const bool contrast = pass != 1;
             const bool average = pass != 2;
-            const double ms = run(heights[i], contrast, average, frame);
+            const bench_result result =
+                run(heights[i], contrast, average, 1, frame);
+            const double ms = result.milliseconds;
             char label[32];
 
             if (ms < 0.0) {
@@ -122,6 +142,7 @@ main(void)
             if (i == 0u && pass == 0) {
                 baseline = ms;
             }
+            checksum ^= result.checksum;
             (void)snprintf(label, sizeof(label), "%d", heights[i]);
             (void)printf("%-8s %-9s %-8s %10.3f %8.1fx %15.1f%%\n",
                          pass == 0 ? label : "", contrast ? "on" : "off",
@@ -129,7 +150,18 @@ main(void)
                          ms, baseline / ms, ms * 7.0);
         }
     }
+    (void)printf("\ndefault-height blur-radius sweep\n");
+    for (int radius = 0; radius <= 16; radius = radius == 0 ? 1 : radius * 4) {
+        const bench_result result = run(100, true, true, radius, frame);
+
+        if (result.milliseconds >= 0.0) {
+            (void)printf("radius %-2d %10.3f ms/frame\n",
+                         radius, result.milliseconds);
+            checksum ^= result.checksum;
+        }
+    }
     (void)printf("\nPercentages are of one core: ms/frame x fps / 10.\n");
+    (void)printf("checksum=%016" PRIx64 "\n", checksum);
     free(frame);
     return 0;
 }

@@ -28,6 +28,7 @@
 
 #include "kilix_motion_detect.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,12 +128,18 @@ static void downscale_luma(const kmd_detector *detector, const uint8_t *frame)
     const int height = detector->scaled_height;
     const kmd_pixfmt format = detector->config.pixfmt;
     uint8_t *out = detector->gray;
+    const int y_step = source_height / height;
+    const int y_remainder = source_height % height;
+    int source_y = 0;
+    int64_t y_error = 0;
 
     for (int y = 0; y < height; y++) {
-        const int source_y = (int)((long)y * source_height / height);
+        const int x_step = source_width / width;
+        const int x_remainder = source_width % width;
+        int source_x = 0;
+        int64_t x_error = 0;
 
         for (int x = 0; x < width; x++) {
-            const int source_x = (int)((long)x * source_width / width);
             const size_t index = (size_t)source_y * (size_t)source_width +
                                  (size_t)source_x;
 
@@ -146,6 +153,18 @@ static void downscale_luma(const kmd_detector *detector, const uint8_t *frame)
                         ? luma(pixel[2], pixel[1], pixel[0])
                         : luma(pixel[0], pixel[1], pixel[2]);
             }
+            source_x += x_step;
+            x_error += x_remainder;
+            if (x_error >= width) {
+                source_x++;
+                x_error -= width;
+            }
+        }
+        source_y += y_step;
+        y_error += y_remainder;
+        if (y_error >= height) {
+            source_y++;
+            y_error -= height;
         }
     }
 }
@@ -161,43 +180,63 @@ static void downscale_luma_average(
     const int height = detector->scaled_height;
     const kmd_pixfmt format = detector->config.pixfmt;
     uint8_t *out = detector->gray;
+    const int y_step = source_height / height;
+    const int y_remainder = source_height % height;
+    int y0 = 0;
+    int64_t y_error = 0;
 
     for (int y = 0; y < height; y++) {
-        const int y0 = (int)((long)y * source_height / height);
-        int y1 = (int)((long)(y + 1) * source_height / height);
+        const int x_step = source_width / width;
+        const int x_remainder = source_width % width;
+        int y1 = y0 + y_step;
+        int x0 = 0;
+        int64_t x_error = 0;
 
-        if (y1 <= y0) {
-            y1 = y0 + 1;
+        y_error += y_remainder;
+        if (y_error >= height) {
+            y1++;
+            y_error -= height;
         }
         for (int x = 0; x < width; x++) {
-            const int x0 = (int)((long)x * source_width / width);
-            int x1 = (int)((long)(x + 1) * source_width / width);
-            unsigned long total = 0ul;
-            unsigned long taken = 0ul;
+            int x1 = x0 + x_step;
+            uint64_t total = 0u;
+            uint64_t taken;
 
-            if (x1 <= x0) {
-                x1 = x0 + 1;
+            x_error += x_remainder;
+            if (x_error >= width) {
+                x1++;
+                x_error -= width;
             }
-            for (int sy = y0; sy < y1 && sy < source_height; sy++) {
-                for (int sx = x0; sx < x1 && sx < source_width; sx++) {
-                    const size_t index =
-                        (size_t)sy * (size_t)source_width + (size_t)sx;
+            if (format == KMD_PIXFMT_GRAY) {
+                for (int sy = y0; sy < y1; sy++) {
+                    const uint8_t *pixel =
+                        frame + (size_t)sy * (size_t)source_width + (size_t)x0;
 
-                    if (format == KMD_PIXFMT_GRAY) {
-                        total += frame[index];
-                    } else {
-                        const uint8_t *pixel = frame + index * 4u;
+                    for (int sx = x0; sx < x1; sx++) {
+                        total += *pixel++;
+                    }
+                }
+            } else {
+                for (int sy = y0; sy < y1; sy++) {
+                    const uint8_t *pixel =
+                        frame + ((size_t)sy * (size_t)source_width +
+                                 (size_t)x0) * 4u;
 
+                    for (int sx = x0; sx < x1; sx++) {
                         total += format == KMD_PIXFMT_BGRA
                                      ? luma(pixel[2], pixel[1], pixel[0])
                                      : luma(pixel[0], pixel[1], pixel[2]);
+                        pixel += 4;
                     }
-                    taken++;
                 }
             }
+            taken = (uint64_t)(unsigned)(x1 - x0) *
+                    (uint64_t)(unsigned)(y1 - y0);
             out[(size_t)y * (size_t)width + (size_t)x] =
-                taken > 0ul ? (uint8_t)(total / taken) : 0u;
+                (uint8_t)(total / taken);
+            x0 = x1;
         }
+        y0 = y1;
     }
 }
 
@@ -216,7 +255,6 @@ static void improve_contrast(kmd_detector *detector)
 {
     const size_t count = detector->scaled_pixels;
     uint8_t *gray = detector->gray;
-    uint8_t histogram[256];
     size_t cumulative = 0u;
     int low = 0;
     int high = 255;
@@ -226,10 +264,9 @@ static void improve_contrast(kmd_detector *detector)
     for (size_t i = 0u; i < count; i++) {
         bins[gray[i]]++;
     }
-    (void)histogram;
-
     {
-        const size_t low_target = count / 25u;         /* 4th percentile */
+        const size_t low_target =
+            count / 25u > 0u ? count / 25u : 1u;       /* 4th percentile */
         const size_t high_target = count - count / 25u; /* 96th */
 
         cumulative = 0u;
@@ -298,53 +335,109 @@ static void improve_contrast(kmd_detector *detector)
  * measurable once the result is thresholded. */
 static void blur(kmd_detector *detector)
 {
-    const int width = detector->scaled_width;
-    const int height = detector->scaled_height;
+    const size_t width = (size_t)detector->scaled_width;
+    const size_t height = (size_t)detector->scaled_height;
     const int radius = detector->config.blur_radius;
     uint8_t *gray = detector->gray;
     uint8_t *scratch = detector->blurred;
+    size_t horizontal_radius;
+    size_t vertical_radius;
 
     if (radius <= 0) {
         return;
     }
-    for (int y = 0; y < height; y++) {
-        const uint8_t *row = gray + (size_t)y * (size_t)width;
-        uint8_t *out = scratch + (size_t)y * (size_t)width;
+    horizontal_radius = (size_t)radius < width ? (size_t)radius : width - 1u;
+    vertical_radius = (size_t)radius < height ? (size_t)radius : height - 1u;
 
-        for (int x = 0; x < width; x++) {
-            unsigned total = 0u;
-            int taken = 0;
+    for (size_t y = 0u; y < height; y++) {
+        const uint8_t *row = gray + y * width;
+        uint8_t *out = scratch + y * width;
+        uint64_t total = 0u;
+        size_t taken = horizontal_radius + 1u;
 
-            for (int dx = -radius; dx <= radius; dx++) {
-                int sample = x + dx;
-
-                if (sample < 0 || sample >= width) {
-                    continue;
-                }
-                total += row[sample];
+        for (size_t sample = 0u; sample <= horizontal_radius; sample++) {
+            total += row[sample];
+        }
+        for (size_t x = 0u; x < width; x++) {
+            out[x] = (uint8_t)(total / taken);
+            if (x >= horizontal_radius) {
+                total -= row[x - horizontal_radius];
+                taken--;
+            }
+            if (x + horizontal_radius + 1u < width) {
+                total += row[x + horizontal_radius + 1u];
                 taken++;
             }
-            out[x] = (uint8_t)(total / (unsigned)taken);
         }
     }
-    for (int y = 0; y < height; y++) {
-        uint8_t *out = gray + (size_t)y * (size_t)width;
+    for (size_t x = 0u; x < width; x++) {
+        uint64_t total = 0u;
+        size_t taken = vertical_radius + 1u;
 
-        for (int x = 0; x < width; x++) {
-            unsigned total = 0u;
-            int taken = 0;
-
-            for (int dy = -radius; dy <= radius; dy++) {
-                int sample = y + dy;
-
-                if (sample < 0 || sample >= height) {
-                    continue;
-                }
-                total += scratch[(size_t)sample * (size_t)width + (size_t)x];
+        for (size_t sample = 0u; sample <= vertical_radius; sample++) {
+            total += scratch[sample * width + x];
+        }
+        for (size_t y = 0u; y < height; y++) {
+            gray[y * width + x] = (uint8_t)(total / taken);
+            if (y >= vertical_radius) {
+                total -= scratch[(y - vertical_radius) * width + x];
+                taken--;
+            }
+            if (y + vertical_radius + 1u < height) {
+                total += scratch[(y + vertical_radius + 1u) * width + x];
                 taken++;
             }
-            out[x] = (uint8_t)(total / (unsigned)taken);
         }
+    }
+}
+
+/* A 3x3 maximum over a binary image.  Two one-dimensional passes produce
+ * exactly the same neighbourhood as nine bounded probes per output pixel. */
+static void dilate(kmd_detector *detector)
+{
+    const size_t width = (size_t)detector->scaled_width;
+    const size_t height = (size_t)detector->scaled_height;
+    const uint8_t *binary = detector->binary;
+    uint8_t *horizontal = detector->blurred;
+    uint8_t *out = detector->dilated;
+
+    for (size_t y = 0u; y < height; y++) {
+        const size_t row = y * width;
+
+        if (width == 1u) {
+            horizontal[row] = binary[row];
+            continue;
+        }
+        horizontal[row] = (uint8_t)(binary[row] | binary[row + 1u]);
+        for (size_t x = 1u; x + 1u < width; x++) {
+            horizontal[row + x] =
+                (uint8_t)(binary[row + x - 1u] | binary[row + x] |
+                          binary[row + x + 1u]);
+        }
+        horizontal[row + width - 1u] =
+            (uint8_t)(binary[row + width - 2u] | binary[row + width - 1u]);
+    }
+
+    if (height == 1u) {
+        memcpy(out, horizontal, width);
+        return;
+    }
+    for (size_t x = 0u; x < width; x++) {
+        out[x] = (uint8_t)(horizontal[x] | horizontal[width + x]);
+    }
+    for (size_t y = 1u; y + 1u < height; y++) {
+        const size_t row = y * width;
+
+        for (size_t x = 0u; x < width; x++) {
+            out[row + x] =
+                (uint8_t)(horizontal[row - width + x] | horizontal[row + x] |
+                          horizontal[row + width + x]);
+        }
+    }
+    for (size_t x = 0u; x < width; x++) {
+        const size_t last = (height - 1u) * width + x;
+
+        out[last] = (uint8_t)(horizontal[last - width] | horizontal[last]);
     }
 }
 
@@ -374,6 +467,11 @@ static void label_union(int *parent, int a, int b)
     }
 }
 
+static int scale_coordinate(int coordinate, int source, int scaled)
+{
+    return (int)((int64_t)coordinate * (int64_t)source / (int64_t)scaled);
+}
+
 static size_t label_components(kmd_detector *detector, kmd_box *boxes,
                                size_t capacity, size_t *found_out)
 {
@@ -384,12 +482,10 @@ static size_t label_components(kmd_detector *detector, kmd_box *boxes,
     int *parent = detector->parent;
     int *area = detector->area;
     kmd_box *extents = detector->extents;
-    const int limit = width * height;
+    const size_t limit = detector->scaled_pixels;
     int next = 1;
     size_t written = 0u;
     size_t found = 0u;
-
-    memset(labels, 0, (size_t)limit * sizeof(int));
 
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
@@ -398,12 +494,13 @@ static size_t label_components(kmd_detector *detector, kmd_box *boxes,
             int left;
 
             if (binary[index] == 0u) {
+                labels[index] = 0;
                 continue;
             }
             up = y > 0 ? labels[index - (size_t)width] : 0;
             left = x > 0 ? labels[index - 1u] : 0;
             if (up == 0 && left == 0) {
-                if (next >= limit) {
+                if ((size_t)next > limit) {
                     continue;   /* pathological; the frame is all noise */
                 }
                 parent[next] = next;
@@ -446,32 +543,23 @@ static size_t label_components(kmd_detector *detector, kmd_box *boxes,
 
     /* Scale extents back to source coordinates, so a caller never has to
      * know what detect_height was. */
-    {
-        const float scale_x =
-            (float)detector->config.width / (float)width;
-        const float scale_y =
-            (float)detector->config.height / (float)height;
-
-        for (int i = 1; i < next; i++) {
-            if (area[i] < detector->config.contour_area) {
-                continue;
-            }
-            found++;
-            if (boxes == NULL || written >= capacity) {
-                continue;
-            }
-            boxes[written].x0 = (int)((float)extents[i].x0 * scale_x);
-            boxes[written].y0 = (int)((float)extents[i].y0 * scale_y);
-            boxes[written].x1 = (int)((float)extents[i].x1 * scale_x);
-            boxes[written].y1 = (int)((float)extents[i].y1 * scale_y);
-            if (boxes[written].x1 > detector->config.width) {
-                boxes[written].x1 = detector->config.width;
-            }
-            if (boxes[written].y1 > detector->config.height) {
-                boxes[written].y1 = detector->config.height;
-            }
-            written++;
+    for (int i = 1; i < next; i++) {
+        if (area[i] < detector->config.contour_area) {
+            continue;
         }
+        found++;
+        if (boxes == NULL || written >= capacity) {
+            continue;
+        }
+        boxes[written].x0 =
+            scale_coordinate(extents[i].x0, detector->config.width, width);
+        boxes[written].y0 =
+            scale_coordinate(extents[i].y0, detector->config.height, height);
+        boxes[written].x1 =
+            scale_coordinate(extents[i].x1, detector->config.width, width);
+        boxes[written].y1 =
+            scale_coordinate(extents[i].y1, detector->config.height, height);
+        written++;
     }
     if (found_out != NULL) {
         *found_out = found;
@@ -484,6 +572,8 @@ bool kmd_detector_create(kmd_detector **out, const kmd_config *config)
     kmd_detector *detector;
     int scaled_width;
     int scaled_height;
+    size_t source_pixels;
+    size_t bytes_per_pixel;
     size_t pixels;
 
     if (out == NULL) {
@@ -504,10 +594,30 @@ bool kmd_detector_create(kmd_detector **out, const kmd_config *config)
     if (config->contour_area < 1 || config->blur_radius < 0) {
         return false;
     }
-    if (config->frame_alpha <= 0.0f || config->frame_alpha > 1.0f) {
+    if (!isfinite(config->frame_alpha) || config->frame_alpha <= 0.0f ||
+        config->frame_alpha > 1.0f) {
+        return false;
+    }
+    if (!isfinite(config->lightning_threshold) ||
+        config->lightning_threshold < 0.0f ||
+        config->lightning_threshold > 1.0f) {
+        return false;
+    }
+    if (!isfinite(config->skip_threshold) || config->skip_threshold < 0.0f ||
+        config->skip_threshold > 1.0f) {
         return false;
     }
     if (config->detect_height < 0) {
+        return false;
+    }
+
+    if ((size_t)config->width > SIZE_MAX / (size_t)config->height) {
+        return false;
+    }
+    source_pixels = (size_t)config->width * (size_t)config->height;
+    bytes_per_pixel = config->pixfmt == KMD_PIXFMT_GRAY ? 1u : 4u;
+    if (source_pixels > SIZE_MAX / bytes_per_pixel ||
+        source_pixels > UINT64_MAX / UINT8_MAX) {
         return false;
     }
 
@@ -515,11 +625,16 @@ bool kmd_detector_create(kmd_detector **out, const kmd_config *config)
                             config->detect_height < config->height
                         ? config->detect_height
                         : config->height;
-    scaled_width = (int)((long)config->width * scaled_height / config->height);
+    scaled_width = (int)((int64_t)config->width * (int64_t)scaled_height /
+                         (int64_t)config->height);
     if (scaled_width < 1) {
         scaled_width = 1;
     }
     pixels = (size_t)scaled_width * (size_t)scaled_height;
+    if (pixels > (size_t)INT_MAX - 1u ||
+        pixels > SIZE_MAX / sizeof(kmd_box) - 1u) {
+        return false;
+    }
 
     detector = calloc(1u, sizeof(*detector));
     if (detector == NULL) {
@@ -595,20 +710,57 @@ bool kmd_detector_set_mask(
             return false;
         }
     }
-    /* Scale the mask the same way frames are scaled, so a masked source
-     * pixel and the frame pixel it covers land in the same scaled cell. */
-    for (int y = 0; y < detector->scaled_height; y++) {
-        const int source_y = (int)((long)y * detector->config.height /
-                                   detector->scaled_height);
+    if (detector->scaled_width == detector->config.width &&
+        detector->scaled_height == detector->config.height) {
+        memcpy(detector->mask, mask, expected);
+    } else if (detector->config.area_average) {
+        /* INTER_AREA-style mask semantics: a scaled cell remains active if
+         * any source pixel contributing to it is active.  Point-sampling the
+         * mask while area-averaging the frame can otherwise discard motion
+         * from unmasked pixels that share a cell with the sample point. */
+        for (int y = 0; y < detector->scaled_height; y++) {
+            const int y0 = (int)((int64_t)y * detector->config.height /
+                                 detector->scaled_height);
+            const int y1 = (int)((int64_t)(y + 1) * detector->config.height /
+                                 detector->scaled_height);
 
-        for (int x = 0; x < detector->scaled_width; x++) {
-            const int source_x = (int)((long)x * detector->config.width /
-                                       detector->scaled_width);
+            for (int x = 0; x < detector->scaled_width; x++) {
+                const int x0 = (int)((int64_t)x * detector->config.width /
+                                     detector->scaled_width);
+                const int x1 =
+                    (int)((int64_t)(x + 1) * detector->config.width /
+                          detector->scaled_width);
+                uint8_t keep = 0u;
 
-            detector->mask[(size_t)y * (size_t)detector->scaled_width +
-                           (size_t)x] =
-                mask[(size_t)source_y * (size_t)detector->config.width +
-                     (size_t)source_x];
+                for (int sy = y0; sy < y1 && keep == 0u; sy++) {
+                    for (int sx = x0; sx < x1; sx++) {
+                        if (mask[(size_t)sy * (size_t)detector->config.width +
+                                 (size_t)sx] != 0u) {
+                            keep = 1u;
+                            break;
+                        }
+                    }
+                }
+                detector->mask[(size_t)y * (size_t)detector->scaled_width +
+                               (size_t)x] = keep;
+            }
+        }
+    } else {
+        /* Point-sampled frames retain point-sampled mask semantics. */
+        for (int y = 0; y < detector->scaled_height; y++) {
+            const int source_y = (int)((int64_t)y * detector->config.height /
+                                       detector->scaled_height);
+
+            for (int x = 0; x < detector->scaled_width; x++) {
+                const int source_x =
+                    (int)((int64_t)x * detector->config.width /
+                          detector->scaled_width);
+
+                detector->mask[(size_t)y * (size_t)detector->scaled_width +
+                               (size_t)x] =
+                    mask[(size_t)source_y * (size_t)detector->config.width +
+                         (size_t)source_x];
+            }
         }
     }
     detector->has_mask = true;
@@ -700,42 +852,33 @@ size_t kmd_detect(
         }
     }
 
-    /* Dilate, so a blob broken by a single sub-threshold pixel stays one
-     * blob rather than becoming two boxes. */
-    {
-        const int width = detector->scaled_width;
-        const int height = detector->scaled_height;
+    fraction = pixels > 0u ? (float)changed / (float)pixels : 0.0f;
 
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                uint8_t value = 0u;
-
-                for (int dy = -1; dy <= 1 && value == 0u; dy++) {
-                    const int sample_y = y + dy;
-
-                    if (sample_y < 0 || sample_y >= height) {
-                        continue;
-                    }
-                    for (int dx = -1; dx <= 1; dx++) {
-                        const int sample_x = x + dx;
-
-                        if (sample_x < 0 || sample_x >= width) {
-                            continue;
-                        }
-                        if (detector->binary[(size_t)sample_y * (size_t)width +
-                                             (size_t)sample_x] != 0u) {
-                            value = 1u;
-                            break;
-                        }
-                    }
-                }
-                detector->dilated[(size_t)y * (size_t)width + (size_t)x] =
-                    value;
-            }
+    /* A skipped frame has no boxes by definition.  Decide before dilation and
+     * component labeling so a storm, camera pan, or IR cutover does not spend
+     * time constructing results that will immediately be discarded. */
+    if (detector->config.skip_threshold > 0.0f &&
+        fraction > detector->config.skip_threshold) {
+        detector->calibrating = true;
+        if (result != NULL) {
+            result->motion_fraction = fraction;
+            result->calibrating = true;
+            result->scene_changed =
+                fraction > detector->config.lightning_threshold;
+            result->skipped = true;
         }
+        /* Still fold the frame in, or the model never catches up to the
+         * condition that caused the skip and every later frame skips too. */
+        for (size_t i = 0u; i < pixels; i++) {
+            detector->model[i] = detector->model[i] * 0.8f +
+                                 (float)detector->gray[i] * 0.2f;
+        }
+        return 0u;
     }
 
-    fraction = pixels > 0u ? (float)changed / (float)pixels : 0.0f;
+    /* Dilate, so a blob broken by a single sub-threshold pixel stays one
+     * blob rather than becoming two boxes. */
+    dilate(detector);
     written = label_components(detector, boxes, capacity, &found);
 
     /* Converged once the scene is quiet: little changed, few blobs. */
@@ -759,30 +902,6 @@ size_t kmd_detect(
     }
 
     /*
-     * Skipping is the one behaviour here that can hide something real,
-     * which is why it is off unless asked for.  When it does fire the
-     * model is forced to re-converge, because whatever produced a
-     * frame-sized difference is the new scene.
-     */
-    if (detector->config.skip_threshold > 0.0f &&
-        fraction > detector->config.skip_threshold) {
-        detector->calibrating = true;
-        if (result != NULL) {
-            result->skipped = true;
-            result->calibrating = true;
-            result->count = 0u;
-            result->found = 0u;
-        }
-        /* Still fold the frame in, or the model never catches up to the
-         * condition that caused the skip and every later frame skips too. */
-        for (size_t i = 0u; i < pixels; i++) {
-            detector->model[i] = detector->model[i] * 0.8f +
-                                 (float)detector->gray[i] * 0.2f;
-        }
-        return 0u;
-    }
-
-    /*
      * Fold the frame into the model.
      *
      * Motion has to persist before it is absorbed.  Averaging in a single
@@ -797,7 +916,9 @@ size_t kmd_detect(
                                 : detector->config.frame_alpha;
 
         if (found > 0u) {
-            detector->motion_frames++;
+            if (detector->motion_frames < PERSIST_FRAMES) {
+                detector->motion_frames++;
+            }
             if (detector->motion_frames >= PERSIST_FRAMES) {
                 for (size_t i = 0u; i < pixels; i++) {
                     detector->model[i] =
