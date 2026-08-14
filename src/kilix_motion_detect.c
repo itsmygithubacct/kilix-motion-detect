@@ -342,6 +342,8 @@ static void blur(kmd_detector *detector)
     uint8_t *scratch = detector->blurred;
     size_t horizontal_radius;
     size_t vertical_radius;
+    uint64_t full;
+    uint64_t magic;
 
     if (radius <= 0) {
         return;
@@ -349,6 +351,20 @@ static void blur(kmd_detector *detector)
     horizontal_radius = (size_t)radius < width ? (size_t)radius : width - 1u;
     vertical_radius = (size_t)radius < height ? (size_t)radius : height - 1u;
 
+    /*
+     * Away from the clamped edges every window in a pass has the same
+     * width d, so the per-pixel division is by a loop-invariant divisor
+     * and becomes a fixed-point reciprocal multiply, which is worth
+     * about a third of the default-configuration frame time.  With
+     * m = 2^40 / d + 1, (n * m) >> 40 equals n / d exactly for every
+     * window sum n <= 255 * d whenever d <= 65535, because
+     * 255 * d * d < 2^40.  Edge windows and oversized divisors keep the
+     * plain division.  The accumulator stays 64-bit: accepted geometries
+     * exist (one row, millions of pixels wide, the radius clamped to the
+     * width) whose edge window sums overflow 32 bits.
+     */
+    full = 2u * (uint64_t)horizontal_radius + 1u;
+    magic = full <= 65535u ? (UINT64_C(1) << 40) / full + 1u : 0u;
     for (size_t y = 0u; y < height; y++) {
         const uint8_t *row = gray + y * width;
         uint8_t *out = scratch + y * width;
@@ -359,7 +375,9 @@ static void blur(kmd_detector *detector)
             total += row[sample];
         }
         for (size_t x = 0u; x < width; x++) {
-            out[x] = (uint8_t)(total / taken);
+            out[x] = taken == full && magic != 0u
+                         ? (uint8_t)((total * magic) >> 40)
+                         : (uint8_t)(total / taken);
             if (x >= horizontal_radius) {
                 total -= row[x - horizontal_radius];
                 taken--;
@@ -370,6 +388,8 @@ static void blur(kmd_detector *detector)
             }
         }
     }
+    full = 2u * (uint64_t)vertical_radius + 1u;
+    magic = full <= 65535u ? (UINT64_C(1) << 40) / full + 1u : 0u;
     for (size_t x = 0u; x < width; x++) {
         uint64_t total = 0u;
         size_t taken = vertical_radius + 1u;
@@ -378,7 +398,9 @@ static void blur(kmd_detector *detector)
             total += scratch[sample * width + x];
         }
         for (size_t y = 0u; y < height; y++) {
-            gray[y * width + x] = (uint8_t)(total / taken);
+            gray[y * width + x] = taken == full && magic != 0u
+                                      ? (uint8_t)((total * magic) >> 40)
+                                      : (uint8_t)(total / taken);
             if (y >= vertical_radius) {
                 total -= scratch[(y - vertical_radius) * width + x];
                 taken--;
