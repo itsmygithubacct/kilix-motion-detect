@@ -60,9 +60,11 @@ test: $(TEST_BINARIES) $(STREAM_BIN)
 	KMD_STREAM=$(abspath $(STREAM_BIN)) sh tests/test_stream.sh
 
 # The cost side of every claim in the README: per-frame time at several
-# working heights, with and without contrast normalisation.
+# working heights, with and without contrast normalisation.  Timing is
+# informational; the workload's motion-decision checksum is held to
+# tests/bench.expected (see tests/checksum.sh).
 bench: $(BENCH_BIN)
-	@$(BENCH_BIN)
+	@sh tests/checksum.sh tests/bench.expected $(BENCH_BIN)
 
 $(BENCH_BIN): examples/bench.c $(STATIC_LIB) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) $(LDFLAGS) \
@@ -80,8 +82,13 @@ $(FUZZ_BIN): tests/fuzz_motion.c $(STATIC_LIB) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) $(LDFLAGS) \
 		$(EXTRA_LDFLAGS) $< $(STATIC_LIB) $(LDLIBS) -o $@
 
+# Every motion decision across the run is folded into one checksum, held
+# to the committed baseline for that case count so silent decision drift
+# fails the suite; case counts without a baseline still run, uncompared.
+# KMD_REBASELINE=1 re-pins after a deliberate behavior change.
 fuzz: $(FUZZ_BIN)
-	$(FUZZ_BIN) $(FUZZ_CASES)
+	@sh tests/checksum.sh tests/fuzz-$(FUZZ_CASES).expected \
+		$(FUZZ_BIN) $(FUZZ_CASES)
 
 sanitize:
 	@$(MAKE) --no-print-directory BUILD_DIR="$(SANITIZE_BUILD_DIR)" clean

@@ -205,7 +205,11 @@ calibration; consumers should ignore boxes while `result.calibrating` is true.
 `make test` covers library behavior and stream-input error paths. `make fuzz`
 adds deterministic randomized configurations, pixel formats, masks, resets,
 capacities, and extreme blur radii. `make sanitize` runs both under
-AddressSanitizer and UndefinedBehaviorSanitizer.
+AddressSanitizer and UndefinedBehaviorSanitizer. `make fuzz` and `make bench`
+fold every motion decision into a checksum that is held to committed baselines
+in `tests/`, so a change that silently alters detection behavior fails the
+suite; a deliberate behavior change re-pins them with `KMD_REBASELINE=1` in the
+commit that explains it.
 
 ## License
 
