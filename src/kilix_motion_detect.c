@@ -128,6 +128,9 @@ static void downscale_luma(const kmd_detector *detector, const uint8_t *frame)
     const int height = detector->scaled_height;
     const kmd_pixfmt format = detector->config.pixfmt;
     uint8_t *out = detector->gray;
+    /* This step/carry walk samples at the boundaries of the
+     * scale_coordinate() partition; see that function before changing
+     * the stepping. */
     const int y_step = source_height / height;
     const int y_remainder = source_height % height;
     int source_y = 0;
@@ -180,6 +183,9 @@ static void downscale_luma_average(
     const int height = detector->scaled_height;
     const kmd_pixfmt format = detector->config.pixfmt;
     uint8_t *out = detector->gray;
+    /* This step/carry walk produces the cell bounds of the
+     * scale_coordinate() partition; see that function before changing
+     * the stepping. */
     const int y_step = source_height / height;
     const int y_remainder = source_height % height;
     int y0 = 0;
@@ -498,6 +504,18 @@ static void label_union(int *parent, int a, int b)
     }
 }
 
+/*
+ * The one definition of the source partition: working cell k on an axis
+ * covers source columns or rows [scale_coordinate(k), scale_coordinate(k+1)).
+ * Boxes are projected back to source coordinates through it and mask scaling
+ * reads it directly.  The downscalers walk the same partition incrementally:
+ * stepping by source / scaled and carrying source % scaled puts boundary k at
+ * k * (source / scaled) + floor(k * (source % scaled) / scaled), which is
+ * floor(k * source / scaled) - exactly this function.  That agreement is what
+ * keeps a mask cell covering the same source pixels as the working cell it
+ * gates; the mask-alignment test holds the two walks together, so change
+ * either one deliberately.
+ */
 static int scale_coordinate(int coordinate, int source, int scaled)
 {
     return (int)((int64_t)coordinate * (int64_t)source / (int64_t)scaled);
@@ -750,17 +768,16 @@ bool kmd_detector_set_mask(
          * mask while area-averaging the frame can otherwise discard motion
          * from unmasked pixels that share a cell with the sample point. */
         for (int y = 0; y < detector->scaled_height; y++) {
-            const int y0 = (int)((int64_t)y * detector->config.height /
-                                 detector->scaled_height);
-            const int y1 = (int)((int64_t)(y + 1) * detector->config.height /
-                                 detector->scaled_height);
+            const int y0 = scale_coordinate(
+                y, detector->config.height, detector->scaled_height);
+            const int y1 = scale_coordinate(
+                y + 1, detector->config.height, detector->scaled_height);
 
             for (int x = 0; x < detector->scaled_width; x++) {
-                const int x0 = (int)((int64_t)x * detector->config.width /
-                                     detector->scaled_width);
-                const int x1 =
-                    (int)((int64_t)(x + 1) * detector->config.width /
-                          detector->scaled_width);
+                const int x0 = scale_coordinate(
+                    x, detector->config.width, detector->scaled_width);
+                const int x1 = scale_coordinate(
+                    x + 1, detector->config.width, detector->scaled_width);
                 uint8_t keep = 0u;
 
                 for (int sy = y0; sy < y1 && keep == 0u; sy++) {
@@ -779,13 +796,12 @@ bool kmd_detector_set_mask(
     } else {
         /* Point-sampled frames retain point-sampled mask semantics. */
         for (int y = 0; y < detector->scaled_height; y++) {
-            const int source_y = (int)((int64_t)y * detector->config.height /
-                                       detector->scaled_height);
+            const int source_y = scale_coordinate(
+                y, detector->config.height, detector->scaled_height);
 
             for (int x = 0; x < detector->scaled_width; x++) {
-                const int source_x =
-                    (int)((int64_t)x * detector->config.width /
-                          detector->scaled_width);
+                const int source_x = scale_coordinate(
+                    x, detector->config.width, detector->scaled_width);
 
                 detector->mask[(size_t)y * (size_t)detector->scaled_width +
                                (size_t)x] =
@@ -945,20 +961,18 @@ size_t kmd_detect(
         const float alpha = detector->calibrating
                                 ? 0.2f
                                 : detector->config.frame_alpha;
+        bool fold;
 
         if (found > 0u) {
             if (detector->motion_frames < PERSIST_FRAMES) {
                 detector->motion_frames++;
             }
-            if (detector->motion_frames >= PERSIST_FRAMES) {
-                for (size_t i = 0u; i < pixels; i++) {
-                    detector->model[i] =
-                        detector->model[i] * (1.0f - alpha) +
-                        (float)detector->gray[i] * alpha;
-                }
-            }
+            fold = detector->motion_frames >= PERSIST_FRAMES;
         } else {
             detector->motion_frames = 0;
+            fold = true;
+        }
+        if (fold) {
             for (size_t i = 0u; i < pixels; i++) {
                 detector->model[i] = detector->model[i] * (1.0f - alpha) +
                                      (float)detector->gray[i] * alpha;

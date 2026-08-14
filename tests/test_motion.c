@@ -259,6 +259,104 @@ test_area_average_mask_keeps_unmasked_subcell(void)
     return true;
 }
 
+/*
+ * The mask scaler computes cell bounds as floor(k * source / scaled) while
+ * the downscalers walk the same partition with an incremental step and
+ * carry.  Their agreement is what keeps an unmasked source pixel attributed
+ * to the working cell the mask thinks it is in, so pin it behaviorally
+ * across awkward geometries: with everything outside one multiplicatively
+ * computed source cell masked, changes outside that cell must stay
+ * invisible and changes inside it must be seen.
+ */
+static bool
+test_mask_cells_align_with_frame_cells(void)
+{
+    /* The last geometry puts the probed cell's boundary exactly on a
+     * remainder carry (k * (source % scaled) is a multiple of scaled), the
+     * one place where an off-by-one in the carry comparison moves a
+     * boundary; the others exercise coprime remainders. */
+    static const int geometries[][3] = {
+        {39, 29, 13}, {97, 61, 17}, {57, 43, 19},
+        {64, 48, 31}, {101, 37, 23}, {31, 31, 7}, {54, 36, 24}
+    };
+
+    for (size_t g = 0u; g < sizeof(geometries) / sizeof(geometries[0]); g++) {
+        const int width = geometries[g][0];
+        const int height = geometries[g][1];
+        const size_t pixels = (size_t)width * (size_t)height;
+        kmd_config config;
+        kmd_detector *detector = NULL;
+        uint8_t *frame;
+        uint8_t *mask;
+        kmd_result result;
+        int scaled_width;
+        int scaled_height;
+        int x0;
+        int x1;
+        int y0;
+        int y1;
+
+        kmd_config_init(&config);
+        config.width = width;
+        config.height = height;
+        config.detect_height = geometries[g][2];
+        config.threshold = 1;
+        config.contour_area = 1;
+        config.improve_contrast = false;
+        config.area_average = true;
+        config.blur_radius = 0;
+        CHECK(kmd_detector_create(&detector, &config));
+        scaled_width = kmd_detector_scaled_width(detector);
+        scaled_height = kmd_detector_scaled_height(detector);
+        {
+            const int cx = scaled_width / 2;
+            const int cy = scaled_height / 2;
+
+            x0 = (int)((int64_t)cx * width / scaled_width);
+            x1 = (int)((int64_t)(cx + 1) * width / scaled_width);
+            y0 = (int)((int64_t)cy * height / scaled_height);
+            y1 = (int)((int64_t)(cy + 1) * height / scaled_height);
+        }
+
+        frame = calloc(pixels, 1u);
+        mask = calloc(pixels, 1u);
+        CHECK(frame != NULL && mask != NULL);
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                mask[(size_t)y * (size_t)width + (size_t)x] = 1u;
+            }
+        }
+        CHECK(kmd_detector_set_mask(detector, mask, pixels));
+        (void)kmd_detect(detector, frame, NULL, 0u, &result);
+
+        /* Every source pixel outside the unmasked cell changes. */
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                if (x < x0 || x >= x1 || y < y0 || y >= y1) {
+                    frame[(size_t)y * (size_t)width + (size_t)x] = 255u;
+                }
+            }
+        }
+        (void)kmd_detect(detector, frame, NULL, 0u, &result);
+        CHECK(result.found == 0u);
+        CHECK(result.motion_fraction == 0.0f);
+
+        /* The unmasked cell itself changes. */
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                frame[(size_t)y * (size_t)width + (size_t)x] = 255u;
+            }
+        }
+        (void)kmd_detect(detector, frame, NULL, 0u, &result);
+        CHECK(result.found == 1u);
+
+        free(mask);
+        free(frame);
+        kmd_detector_free(detector);
+    }
+    return true;
+}
+
 /* Float scale factors could round an exclusive full-frame edge down by one;
  * exact integer mapping must always return the complete source extent. */
 static bool
@@ -788,6 +886,8 @@ main(void)
          test_tiny_contrast_uses_a_real_sample},
         {"area-average mask keeps unmasked subcell",
          test_area_average_mask_keeps_unmasked_subcell},
+        {"mask cells align with frame cells",
+         test_mask_cells_align_with_frame_cells},
         {"boxes reach exact source edges", test_boxes_reach_exact_source_edges},
         {"a still scene reports no motion",
          test_a_still_scene_reports_no_motion},
