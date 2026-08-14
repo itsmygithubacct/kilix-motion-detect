@@ -318,15 +318,24 @@ static void improve_contrast(kmd_detector *detector)
         if (span < 1.0f) {
             return;
         }
-        for (size_t i = 0u; i < count; i++) {
-            float value = ((float)gray[i] - average_low) / span * 255.0f;
+        /* The stretch depends only on the 8-bit input value, so evaluate
+         * the float expression once per value rather than once per pixel;
+         * the table is filled by the same expression, so the output bytes
+         * cannot change. */
+        uint8_t lut[256];
+
+        for (int v = 0; v < 256; v++) {
+            float value = ((float)v - average_low) / span * 255.0f;
 
             if (value < 0.0f) {
                 value = 0.0f;
             } else if (value > 255.0f) {
                 value = 255.0f;
             }
-            gray[i] = (uint8_t)value;
+            lut[v] = (uint8_t)value;
+        }
+        for (size_t i = 0u; i < count; i++) {
+            gray[i] = lut[gray[i]];
         }
     }
 }
