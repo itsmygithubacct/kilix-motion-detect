@@ -390,9 +390,11 @@ static void blur(kmd_detector *detector)
             total += row[sample];
         }
         for (size_t x = 0u; x < width; x++) {
-            out[x] = taken == full && magic != 0u
-                         ? (uint8_t)((total * magic) >> 40)
-                         : (uint8_t)(total / taken);
+            if (taken == full && magic != 0u) {
+                out[x] = (uint8_t)((total * magic) >> 40);
+            } else {
+                out[x] = (uint8_t)(total / taken);
+            }
             if (x >= horizontal_radius) {
                 total -= row[x - horizontal_radius];
                 taken--;
@@ -413,9 +415,11 @@ static void blur(kmd_detector *detector)
             total += scratch[sample * width + x];
         }
         for (size_t y = 0u; y < height; y++) {
-            gray[y * width + x] = taken == full && magic != 0u
-                                      ? (uint8_t)((total * magic) >> 40)
-                                      : (uint8_t)(total / taken);
+            if (taken == full && magic != 0u) {
+                gray[y * width + x] = (uint8_t)((total * magic) >> 40);
+            } else {
+                gray[y * width + x] = (uint8_t)(total / taken);
+            }
             if (y >= vertical_radius) {
                 total -= scratch[(y - vertical_radius) * width + x];
                 taken--;
