@@ -41,12 +41,12 @@ make sanitize
 make bench      # cost per frame at several working sizes
 ```
 
-`make stream` builds `kmd-stream`, which runs the detector over raw frames on
-standard input and prints one line per frame with motion:
+`make stream` builds `build/kmd-stream`, which runs the detector over raw
+grayscale frames on standard input and prints one line per frame with motion:
 
 ```sh
 ffmpeg -i clip.mkv -f rawvideo -pix_fmt gray -vf scale=640:360 - \
-  | kmd-stream 640 360 [detect_height] [contrast:0|1]
+  | build/kmd-stream 640 360 [detect_height] [contrast:0|1]
 ```
 
 `make install` installs the static and shared libraries and the header.
